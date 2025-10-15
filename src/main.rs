@@ -8,6 +8,16 @@ use std::env;
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     let mut chars = encoded_value.chars();
     match chars.next() {
+        Some('l') => {
+            let mut rest = chars.as_str();
+            let mut result = Vec::new();
+            while !rest.is_empty() && rest.chars().next() != Some('e') {
+                let (value, remaining) = decode_bencoded_value(rest);
+                result.push(value);
+                rest = remaining;
+            }
+            (result.into(), rest.strip_prefix("e").expect("List does not end with 'e'"))
+        }
         Some('i') => {
             let (num, rest) = chars.as_str()
                 .split_once('e')
