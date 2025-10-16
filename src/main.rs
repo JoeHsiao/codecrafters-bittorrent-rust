@@ -1,7 +1,13 @@
+extern crate core;
+
+use core::fmt;
 use serde_json;
 use serde::{Deserialize};
-use std::env;
+use std::{env, fs};
 use serde_bencode;
+use fmt::Display;
+use std::fmt::Formatter;
+use serde_bytes::ByteBuf;
 
 #[derive(Deserialize)]
 struct Torrent {
@@ -24,7 +30,7 @@ struct Info {
     /// pieces maps to a string whose length is a multiple of 20.
     /// It is to be subdivided into strings of length 20, each of which is the SHA1 hash of
     /// the piece at the corresponding index.
-    pieces: Vec<u8>,
+    pieces: ByteBuf,
 
     /// There is also a key length or a key files, but not both or neither.
     /// If length is present then the download represents a single file, otherwise it represents
@@ -33,7 +39,6 @@ struct Info {
     files: FileList,
 }
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
 #[serde(untagged)]
 enum FileList {
     SingleFile {
@@ -49,6 +54,18 @@ struct FileDetails {
     path: Vec<String>,
 }
 
+impl Display for FileList {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileList::SingleFile { length} => {
+                write!(f, "{length}")
+            }
+            FileList::MultiFile {files} => {
+                write!(f, "We do not yet support multi-file torrent")
+            }
+        }
+    }
+}
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     let mut chars = encoded_value.chars();
@@ -85,8 +102,6 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
         None => { (serde_json::Value::Null, chars.as_str()) }
     }
 }
-
-// Usage: your_program.sh decode "<encoded_value>"
 fn main() {
     let args: Vec<String> = env::args().collect();
     let command = &args[1];
@@ -99,6 +114,13 @@ fn main() {
         let encoded_value = &args[2];
         let (decoded_value, _) = decode_bencoded_value(encoded_value);
         println!("{}", decoded_value.to_string());
+    } else if command == "info" {
+        let f = &args[2];
+        let torrent_bytes = fs::read(f).expect("Read the torrent file");
+        let torrent: Torrent = serde_bencode::from_bytes(&torrent_bytes).expect("Deserialize the torrent file");
+        println!("Track URL: {}", torrent.announce);
+        println!("Length: {}", torrent.info.files)
+
     } else {
         println!("unknown command: {}", args[1])
     }
