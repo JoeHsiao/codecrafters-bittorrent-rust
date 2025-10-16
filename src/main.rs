@@ -126,9 +126,18 @@ fn main() {
         let info_hash = hasher.finalize();
         let info_hash = hex::encode(info_hash);
 
+        let mut chunks = torrent.info.pieces.chunks_exact(20);
+
+
         println!("Track URL: {}", torrent.announce);
         println!("Length: {}", torrent.info.files);
         println!("Info Hash: {info_hash}");
+        println!("Piece Length: {}", torrent.info.piece_length);
+        println!("Piece Hashes:");
+        while let Some(c) = chunks.next() {
+            println!("{}", hex::encode(c));
+        }
+
     } else {
         println!("unknown command: {}", args[1])
     }
