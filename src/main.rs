@@ -2,21 +2,22 @@ extern crate core;
 
 use core::fmt;
 use serde_json;
-use serde::{Deserialize};
+use serde::{Deserialize, Serialize};
 use std::{env, fs};
 use serde_bencode;
 use fmt::Display;
 use std::fmt::Formatter;
 use serde_bytes::ByteBuf;
+use sha1::{Digest, Sha1};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Torrent {
     /// The URL of the tracker
     announce: String,
     info: Info,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Info {
     /// In the single file case, name is the name of a file
     /// In the multiple file case, it's the name of a directory.
@@ -38,7 +39,7 @@ struct Info {
     #[serde(flatten)]
     files: FileList,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum FileList {
     SingleFile {
@@ -48,7 +49,7 @@ enum FileList {
         files: Vec<FileDetails>,
     },
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct FileDetails {
     length: usize,
     path: Vec<String>,
@@ -118,9 +119,16 @@ fn main() {
         let f = &args[2];
         let torrent_bytes = fs::read(f).expect("Read the torrent file");
         let torrent: Torrent = serde_bencode::from_bytes(&torrent_bytes).expect("Deserialize the torrent file");
-        println!("Track URL: {}", torrent.announce);
-        println!("Length: {}", torrent.info.files)
+        let info = serde_bencode::to_bytes(&torrent.info).expect("Serialize info");
 
+        let mut hasher = Sha1::new();
+        hasher.update(&info);
+        let info_hash = hasher.finalize();
+        let info_hash = hex::encode(info_hash);
+
+        println!("Track URL: {}", torrent.announce);
+        println!("Length: {}", torrent.info.files);
+        println!("Info Hash: {info_hash}");
     } else {
         println!("unknown command: {}", args[1])
     }
