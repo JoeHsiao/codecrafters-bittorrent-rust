@@ -1,14 +1,19 @@
 extern crate core;
 
+use codecrafters_bittorrent::tracker::TrackerResponse;
 use core::fmt;
-use serde_json;
-use serde::{Deserialize, Serialize};
-use std::{env, fs};
-use serde_bencode;
 use fmt::Display;
-use std::fmt::Formatter;
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
+use serde_bencode;
 use serde_bytes::ByteBuf;
+use serde_json;
 use sha1::{Digest, Sha1};
+use std::fmt::Formatter;
+use std::path::Path;
+use std::str::FromStr;
+use std::{env, fs};
+use urlencoding;
 
 #[derive(Deserialize, Serialize)]
 struct Torrent {
@@ -17,6 +22,23 @@ struct Torrent {
     info: Info,
 }
 
+impl Torrent {
+    fn from_file(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let torrent_bytes = fs::read(path).expect("Read the torrent file");
+        serde_bencode::from_bytes(&torrent_bytes).expect("Deserialize the torrent file")
+    }
+    fn info(&self) -> Vec<u8> {
+        serde_bencode::to_bytes(&self.info).expect("Serialize info")
+    }
+    fn info_sha1(&self) -> [u8; 20] {
+        Sha1::digest(&self.info()).into()
+    }
+
+    fn info_sha1_hex(&self) -> String {
+        hex::encode(self.info_sha1())
+    }
+}
 #[derive(Deserialize, Serialize)]
 struct Info {
     /// In the single file case, name is the name of a file
@@ -42,12 +64,8 @@ struct Info {
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum FileList {
-    SingleFile {
-        length: usize,
-    },
-    MultiFile {
-        files: Vec<FileDetails>,
-    },
+    SingleFile { length: usize },
+    MultiFile { files: Vec<FileDetails> },
 }
 #[derive(Deserialize, Serialize)]
 struct FileDetails {
@@ -58,11 +76,11 @@ struct FileDetails {
 impl Display for FileList {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileList::SingleFile { length} => {
+            FileList::SingleFile { length } => {
                 write!(f, "{length}")
             }
-            FileList::MultiFile {files} => {
-                write!(f, "We do not yet support multi-file torrent")
+            FileList::MultiFile { .. } => {
+                todo!()
             }
         }
     }
@@ -79,14 +97,21 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
                 result.push(value);
                 rest = remaining;
             }
-            (result.into(), rest.strip_prefix("e").expect("List does not end with 'e'"))
+            (
+                result.into(),
+                rest.strip_prefix("e").expect("List does not end with 'e'"),
+            )
         }
         Some('i') => {
-            let (num, rest) = chars.as_str()
+            let (num, rest) = chars
+                .as_str()
                 .split_once('e')
                 .expect("Missing 'e' in a number");
             if num.contains('.') {
-                (num.parse::<f64>().expect("Invalid floating number").into(), rest)
+                (
+                    num.parse::<f64>().expect("Invalid floating number").into(),
+                    rest,
+                )
             } else {
                 (num.parse::<i64>().expect("Invalid number").into(), rest)
             }
@@ -99,11 +124,15 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
             let (string, rest) = rest.split_at(len);
             (string.into(), rest)
         }
-        Some(_) => { panic!("Unhandled encoded value: {}", encoded_value); }
-        None => { (serde_json::Value::Null, chars.as_str()) }
+        Some(_) => {
+            panic!("Unhandled encoded value: {}", encoded_value);
+        }
+        None => (serde_json::Value::Null, chars.as_str()),
     }
 }
-fn main() {
+
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     let command = &args[1];
 
@@ -117,28 +146,57 @@ fn main() {
         println!("{}", decoded_value.to_string());
     } else if command == "info" {
         let f = &args[2];
-        let torrent_bytes = fs::read(f).expect("Read the torrent file");
-        let torrent: Torrent = serde_bencode::from_bytes(&torrent_bytes).expect("Deserialize the torrent file");
-        let info = serde_bencode::to_bytes(&torrent.info).expect("Serialize info");
-
-        let mut hasher = Sha1::new();
-        hasher.update(&info);
-        let info_hash = hasher.finalize();
-        let info_hash = hex::encode(info_hash);
-
+        let torrent = Torrent::from_file(f);
         let mut chunks = torrent.info.pieces.chunks_exact(20);
-
 
         println!("Track URL: {}", torrent.announce);
         println!("Length: {}", torrent.info.files);
-        println!("Info Hash: {info_hash}");
+        println!("Info Hash: {}", torrent.info_sha1_hex());
         println!("Piece Length: {}", torrent.info.piece_length);
         println!("Piece Hashes:");
         while let Some(c) = chunks.next() {
             println!("{}", hex::encode(c));
+        }
+    } else if command == "peers" {
+        let f = &args[2];
+        let torrent = Torrent::from_file(f);
+
+        let mut url = Url::from_str(&torrent.announce).expect("Tracker announce");
+        let query = format!(
+            "port=6881&uploaded=0&downloaded=0&compact=1&peer_id={}&left={}&info_hash={}",
+            "12345678900987654321",
+            torrent.info.piece_length,
+            urlencoding::encode_binary(&torrent.info_sha1())
+        );
+        url.set_query(Some(&query));
+
+        let client = Client::new();
+        let res = client
+            .get(url)
+            .send()
+            .await
+            .expect("Response from peers")
+            .bytes()
+            .await
+            .expect("Get response bytes");
+
+        let tracker_res: TrackerResponse =
+            serde_bencode::from_bytes(&res).expect("Deserialize tracker response");
+
+        for bytes in tracker_res.peers.chunks_exact(6) {
+            let (ip, port) = bytes.split_at(4);
+            println!(
+                "{}.{}.{}.{}:{}",
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                u16::from_be_bytes([port[0], port[1]])
+            );
         }
 
     } else {
         println!("unknown command: {}", args[1])
     }
 }
+
