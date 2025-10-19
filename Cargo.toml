@@ -21,3 +21,4 @@ tempfile = "3"                                                     # creating te
 thiserror = "1.0.38"                                               # error handling
 tokio = { version = "1.23.0", features = ["full"] }                # async http requests
 urlencoding = "2.1.3"
+panic = "0.4.0"
