@@ -1,8 +1,8 @@
 extern crate core;
+use codecrafters_bittorrent::commands::{download_piece, handshake, peers};
+use codecrafters_bittorrent::torrent::Torrent;
 use serde_json;
 use std::env;
-use codecrafters_bittorrent::commands::{handshake, peers};
-use codecrafters_bittorrent::torrent::Torrent;
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
@@ -83,6 +83,13 @@ async fn main() {
         }
     } else if command == "handshake" {
         println!("{}", handshake(&args[2], &args[3]).await);
+    } else if command == "download_piece" {
+        download_piece(
+            &args[4],
+            &args[3],
+            args[5].parse::<usize>().expect("parse piece index"),
+        )
+        .await;
     } else {
         println!("unknown command: {}", args[1])
     }
