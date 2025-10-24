@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Torrent {
     /// The URL of the tracker
     pub announce: String,
@@ -29,7 +29,7 @@ impl Torrent {
         hex::encode(self.info_sha1())
     }
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Info {
     /// In the single file case, name is the name of a file
     /// In the multiple file case, it's the name of a directory.
@@ -51,7 +51,7 @@ pub struct Info {
     #[serde(flatten)]
     pub files: FileList,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(untagged)]
 pub enum FileList {
     SingleFile { length: usize },
@@ -71,7 +71,7 @@ impl Display for FileList {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct FileDetails {
     length: usize,
     path: Vec<String>,

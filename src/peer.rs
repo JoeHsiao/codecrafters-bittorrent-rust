@@ -61,6 +61,25 @@ impl PeerMessage {
             .expect("Read peer message contents");
         msg_buf
     }
+    fn iterate_contents<I>(bytes: I) -> impl Iterator<Item = usize>
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        bytes.into_iter().enumerate().flat_map(|(i, val)| {
+            (0..u8::BITS as usize)
+                .filter_map(move |shift| (val & (128 >> shift) > 0).then_some(i * 8 + shift))
+        })
+    }
+    pub fn piece_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        // Sadly this still copies the underlying byte array, but only when the iterator being invoked.
+        // And the byte array should only be couple bytes large.
+        // The benefit is we can eliminate duplicated code.
+        Self::iterate_contents(self.content.iter().copied())
+    }
+
+    pub fn into_piece_indices(self) -> impl Iterator<Item = usize> {
+        Self::iterate_contents(self.content)
+    }
 }
 
 impl Handshake {
@@ -147,7 +166,7 @@ impl Encoder<PeerMessage> for PeerMessageCodec {
         if length > MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Frame of length {} is too large.", length)
+                format!("Frame of length {} is too large.", length),
             ));
         }
 
