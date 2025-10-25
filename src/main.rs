@@ -94,8 +94,7 @@ async fn main() {
         .await;
     } else if command == "download_files" {
         let mut downloader = Downloader::new(&args[2]).await.expect("Create downloader");
-        eprintln!("{:?}", downloader);
-        downloader.download_all().await;
+        downloader.download_all_concurrent().await;
     } else {
         println!("unknown command: {}", args[1])
     }

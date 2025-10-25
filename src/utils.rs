@@ -1,12 +1,16 @@
 use crate::peer::{Handshake, PeerMessageCodec};
 use crate::torrent::Torrent;
 use crate::tracker::TrackerResponse;
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::{Client, Url};
+use std::io::SeekFrom;
+use std::iter;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -30,7 +34,6 @@ pub async fn get_peers(torrent: &Torrent) -> Vec<SocketAddrV4> {
         .await
         .expect("Get response bytes");
 
-    eprintln!("res bytes: {:?}", res);
     let tracker_res: TrackerResponse =
         serde_bencode::from_bytes(&res).expect("Deserialize tracker response");
 
@@ -84,4 +87,38 @@ pub async fn get_bitfield(ip: &SocketAddrV4, info_hash: &[u8; 20]) -> impl Itera
 
     assert_eq!(msg.kind, 5, "Not a bitfield message, but {}", msg.kind);
     msg.into_piece_indices()
+}
+
+pub fn split_piece_by_file(
+    files: Vec<(PathBuf, usize, usize)>,
+    piece: Vec<u8>,
+) -> impl Iterator<Item = (PathBuf, usize, Vec<u8>)> {
+    let mut head = 0;
+    let mut files = files.into_iter();
+
+    iter::from_fn(move || match files.next() {
+        Some((file, offset, size)) => {
+            assert!(head + size <= piece.len(), "piece cannot fit into file");
+            let result = Some((file, offset, piece[head..size].to_vec()));
+            head += size;
+            result
+        }
+        None => None,
+    })
+}
+
+pub async fn write_to_file(path: &Path, offset: usize, data: Vec<u8>) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(path)
+        .await
+        .context("Open file")?;
+
+    file.seek(SeekFrom::Start(offset as u64))
+        .await
+        .context("Seek file offset")?;
+
+    file.write_all(&data).await.context("Write to file")?;
+    Ok(())
 }

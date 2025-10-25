@@ -1,21 +1,20 @@
 use crate::peer::{Handshake, PeerMessage, PeerMessageCodec};
 use crate::torrent::{FileList, Torrent};
-use crate::utils::{get_bitfield, get_peers};
+use crate::utils::{get_bitfield, get_peers, split_piece_by_file, write_to_file};
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 use std::cmp::min;
-use std::io::SeekFrom;
 use std::net::SocketAddrV4;
-use std::path::Path;
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 #[derive(Debug)]
 pub struct Downloader {
-    torrent: Torrent,
+    torrent: Arc<Torrent>,
     pieces_state: Vec<bool>,
     who_has_pieces: Vec<Vec<SocketAddrV4>>,
 }
@@ -25,7 +24,7 @@ const PIECE_SHA1_LENGTH: usize = 20;
 impl Downloader {
     /// We assume that peers have all the pieces.
     /// todo!("Handle the situation where pieces are missing from peers")
-    pub async fn download_all(&mut self) {
+    pub async fn download_all_sequential(&mut self) {
         for i in 0..self.pieces_state.len() {
             if self.pieces_state[i] {
                 continue;
@@ -36,12 +35,68 @@ impl Downloader {
                 todo!("handle the case if nobody has this piece")
             }
             let piece = Self::download_piece_in_memory(&self.torrent, &peers[0], i).await;
-            if let Err(err) = self.write_piece_to_files(i, piece).await {
-                panic!("{}: Failed to write piece {} to file", err, i);
-            } else {
+            match self.write_piece_to_files(i, piece).await {
+                Ok(()) => self.pieces_state[i] = true,
+                Err(err) => panic!("{}: Failed to write piece {} to file", err, i),
+            }
+        }
+    }
+    pub async fn download_all_concurrent(&mut self) {
+        let mut read_handles = Vec::new();
+        let mut write_handles = Vec::new();
+
+        for i in 0..self.pieces_state.len() {
+            if self.pieces_state[i] {
+                continue;
+            }
+
+            let peers = &self.who_has_pieces[i];
+            if peers.is_empty() {
+                eprintln!("Nobody has piece {}", i);
+                todo!("handle the case if nobody has this piece")
+            }
+
+            let peer = self.who_has_pieces[i][0].clone();
+            let torrent = Arc::clone(&self.torrent);
+
+            read_handles.push(tokio::spawn(async move {
+                (i, Self::download_piece_in_memory(&torrent, &peer, i).await)
+            }));
+        }
+        for read_handle in read_handles {
+            let (i, piece) = read_handle.await.expect("Join read handle");
+            let files = self.get_where_to_write(i, piece.len()).clone();
+
+            let mut split_into = split_piece_by_file(files, piece);
+            while let Some((path, offset, data)) = split_into.next() {
+                write_handles.push(tokio::spawn(async move {
+                    (i, write_to_file(&path, offset, data).await)
+                }));
+            }
+        }
+
+        for write_handle in write_handles {
+            let (i, res) = write_handle.await.expect("Join write handle");
+            if let Ok(_) = res {
                 self.pieces_state[i] = true;
             }
         }
+
+        println!("done!");
+    }
+
+    async fn write_piece_to_files(&self, piece_i: usize, piece: Vec<u8>) -> Result<()> {
+        let dests = self.get_where_to_write(piece_i, piece.len());
+
+        let mut piece = &piece[..];
+        for (path, start, size) in dests {
+            let (val, rest) = piece.split_at(size);
+            write_to_file(&path, start, val.to_vec())
+                .await
+                .context("Write piece to file")?;
+            piece = rest;
+        }
+        Ok(())
     }
     pub async fn download_piece_in_memory(
         torrent: &Torrent,
@@ -59,8 +114,12 @@ impl Downloader {
             length: 19,
             string: b"BitTorrent protocol".to_owned(),
             reserved: [0; 8],
-            peer_id: "12345678900987654321"
-                .as_bytes()
+            // We use a different peer id each time a piece is downloaded because this function is
+            // called concurrently by multiple threads. Using the same peer id when talking to the same
+            // peer on different threads would mess up the communications.
+            // In reality, we should establish a connection from a peer only once and re-use it for
+            // subsequent downloads if they are from the same peer.
+            peer_id: Sha1::digest(format!("BT piece {piece_index}"))
                 .try_into()
                 .expect("init peer_id"),
             info_hash: torrent.info_sha1(),
@@ -171,13 +230,14 @@ impl Downloader {
         Self::fill_who_has_pieces(&peers, &mut who_has_pieces, &t.info_sha1()).await;
 
         Ok(Downloader {
-            torrent: t,
+            torrent: Arc::new(t),
             pieces_state,
             who_has_pieces,
         })
     }
 
-    fn get_where_to_write(&self, piece_i: usize, piece_len: usize) -> Vec<(&Path, usize, usize)> {
+    // todo!("Rewrite this function to return an iterator instead")
+    fn get_where_to_write(&self, piece_i: usize, piece_len: usize) -> Vec<(PathBuf, usize, usize)> {
         match &self.torrent.info.files {
             FileList::SingleFile { length } => {
                 let global_start = self.torrent.info.piece_length * piece_i;
@@ -185,33 +245,16 @@ impl Downloader {
                     global_start + piece_len <= *length,
                     "piece will be written over file boundary"
                 );
-                vec![(self.torrent.info.name.as_ref(), global_start, piece_len)]
+                vec![(
+                    self.torrent.info.name.clone().into(),
+                    global_start,
+                    piece_len,
+                )]
             }
             FileList::MultiFile { .. } => {
                 todo!()
             }
         }
-    }
-    async fn write_piece_to_files(&self, piece_i: usize, piece: Vec<u8>) -> Result<()> {
-        let dest = self.get_where_to_write(piece_i, piece.len());
-        eprintln!("{:?}", dest);
-
-        let mut piece = &piece[..];
-        for (path, start, size) in dest {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(path)
-                .await
-                .context("Open file")?;
-            file.seek(SeekFrom::Start(start as u64))
-                .await
-                .context("Seek file offset")?;
-            let (val, rest) = piece.split_at(size);
-            file.write_all(val).await.context("Write to file")?;
-            piece = rest;
-        }
-        Ok(())
     }
 
     fn load_pieces_state() -> Option<Vec<bool>> {
