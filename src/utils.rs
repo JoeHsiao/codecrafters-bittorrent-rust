@@ -1,58 +1,31 @@
-use crate::peer::{Handshake, PeerMessageCodec};
-use crate::torrent::Torrent;
-use crate::tracker::TrackerResponse;
+use crate::peer::{Handshake, PeerAgentCommand, PeerHandle, PeerMessageCodec};
 use anyhow::{Context, Result};
-use futures::StreamExt;
-use reqwest::{Client, Url};
+use futures_util::StreamExt;
 use std::io::SeekFrom;
 use std::iter;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
+// pub async fn get_peers_from_path(torrent_path: impl AsRef<Path>) -> Vec<SocketAddrV4> {
+//     let torrent = Torrent::from_file(torrent_path);
+//     eprintln!("{:?}", torrent.info.piece_length);
+//     get_peers(&torrent).await
+// }
 
-pub async fn get_peers(torrent: &Torrent) -> Vec<SocketAddrV4> {
-    let mut url = Url::from_str(&torrent.announce).expect("Tracker announce");
-    let query = format!(
-        "port=6881&uploaded=0&downloaded=0&compact=1&peer_id={}&left={}&info_hash={}",
-        "12345678900987654321",
-        torrent.info.piece_length,
-        urlencoding::encode_binary(&torrent.info_sha1())
-    );
-    url.set_query(Some(&query));
 
-    let client = Client::new();
-    let res = client
-        .get(url)
-        .send()
-        .await
-        .expect("Response from peers")
-        .bytes()
-        .await
-        .expect("Get response bytes");
 
-    let tracker_res: TrackerResponse =
-        serde_bencode::from_bytes(&res).expect("Deserialize tracker response");
-
-    let mut peers = Vec::new();
-    for bytes in tracker_res.peers.chunks_exact(6) {
-        let (ip, port) = bytes.split_at(4);
-        peers.push(SocketAddrV4::new(
-            Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
-            u16::from_be_bytes([port[0], port[1]]),
-        ));
-    }
-    peers
-}
-
-pub async fn get_peers_from_path(torrent_path: impl AsRef<Path>) -> Vec<SocketAddrV4> {
-    let torrent = Torrent::from_file(torrent_path);
-    eprintln!("{:?}", torrent.info.piece_length);
-    get_peers(&torrent).await
-}
+// pub async fn handshake(peer_handle: &PeerHandle, handshake: Handshake) -> anyhow::Result<[u8; 20]> {
+//     let (tx, rx) = tokio::sync::oneshot::channel();
+//     let command = PeerAgentCommand::Handshake {
+//         handshake,
+//         tx
+//     };
+//     peer_handle.command_tx.send(command).await.context("Send peer handshake")?;
+//     rx.await.context("Handshake failed")?
+// }
 
 pub async fn get_bitfield(ip: &SocketAddrV4, info_hash: &[u8; 20]) -> impl Iterator<Item = usize> {
     let mut stream = TcpStream::connect(ip).await.expect("Tcp connection");
@@ -89,7 +62,7 @@ pub async fn get_bitfield(ip: &SocketAddrV4, info_hash: &[u8; 20]) -> impl Itera
     msg.into_piece_indices()
 }
 
-pub fn split_piece_by_file(
+pub fn split_piece_for_files(
     files: Vec<(PathBuf, usize, usize)>,
     piece: Vec<u8>,
 ) -> impl Iterator<Item = (PathBuf, usize, Vec<u8>)> {
@@ -98,7 +71,7 @@ pub fn split_piece_by_file(
 
     iter::from_fn(move || match files.next() {
         Some((file, offset, size)) => {
-            assert!(head + size <= piece.len(), "piece cannot fit into file");
+            assert!(head + size <= piece.len(), "piece length not long enough to split into files");
             let result = Some((file, offset, piece[head..size].to_vec()));
             head += size;
             result
@@ -107,7 +80,7 @@ pub fn split_piece_by_file(
     })
 }
 
-pub async fn write_to_file(path: &Path, offset: usize, data: Vec<u8>) -> Result<()> {
+pub async fn write_to_file(path: &Path, offset: usize, data: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -122,3 +95,4 @@ pub async fn write_to_file(path: &Path, offset: usize, data: Vec<u8>) -> Result<
     file.write_all(&data).await.context("Write to file")?;
     Ok(())
 }
+

@@ -1,8 +1,9 @@
 use bytes::{Buf, BufMut, BytesMut};
+use futures_util::stream::SplitSink;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Handshake {
@@ -21,7 +22,7 @@ pub struct Handshake {
     /// peer id (20 bytes) (generate 20 random byte values)
     pub peer_id: [u8; 20],
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PeerMessage {
     pub length: [u8; 4],
     pub kind: u8,
@@ -34,6 +35,21 @@ impl PeerMessage {
             length: [0; 4],
             kind: 0,
             content: vec![],
+        }
+    }
+    pub fn new_request(piece_i: usize, offset: usize, block_size: usize) -> Self {
+        let content = [
+            (piece_i as u32).to_be_bytes(),
+            (offset as u32).to_be_bytes(),
+            (block_size as u32).to_be_bytes(),
+        ]
+        .concat();
+        let length:[u8; 4] = ((content.len() + 1) as u32).to_be_bytes();
+
+        PeerMessage {
+            length,
+            kind: 6,
+            content,
         }
     }
     pub fn to_bytes(&self) -> BytesMut {
@@ -61,6 +77,7 @@ impl PeerMessage {
             .expect("Read peer message contents");
         msg_buf
     }
+
     fn iterate_contents<I>(bytes: I) -> impl Iterator<Item = usize>
     where
         I: IntoIterator<Item = u8>,
@@ -113,7 +130,7 @@ impl Decoder for PeerMessageCodec {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
+        if src.len() <= 4 {
             // Not enough data to read length marker.
             return Ok(None);
         }
@@ -123,8 +140,8 @@ impl Decoder for PeerMessageCodec {
         length_bytes.copy_from_slice(&src[..4]);
         let length = u32::from_be_bytes(length_bytes) as usize;
 
-        // Check that the length is not too large to avoid a denial of
-        // service attack where the server runs out of memory.
+        // Check that the length is not too large to avoid a denial-of-service
+        // attack where the server runs out of memory.
         if length > MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -179,4 +196,78 @@ impl Encoder<PeerMessage> for PeerMessageCodec {
         dst.extend_from_slice(&item.content);
         Ok(())
     }
+}
+#[derive(Debug, PartialEq)]
+pub enum Status {
+    Choked,
+    Unchoked,
+}
+
+
+pub struct PeerHandle {
+    pub request_rx: tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
+    pub agent_sender: SplitSink<Framed<TcpStream, PeerMessageCodec>, PeerMessage>,
+    pub status_rx: tokio::sync::watch::Receiver<Option<Status>>,
+    pub bitfield_rx: tokio::sync::watch::Receiver<Option<Bitfield>>,
+}
+
+impl PeerHandle {
+    pub fn is_unchocked(&self) -> bool {
+        let status = match self.status_rx.borrow().as_ref() {
+            Some(&Status::Choked) => "peer chocked",
+            Some(&Status::Unchoked) => "peer unchocked",
+            None => "peer not send chocked/unchocked"
+        };
+        eprintln!("{status}");
+
+        self.status_rx.borrow().as_ref() == Some(&Status::Unchoked)
+    }
+    pub fn has_piece(&self, i: usize) -> anyhow::Result<bool> {
+        match self.bitfield_rx.borrow().as_ref() {
+            Some(bitfield) => Ok(bitfield.has_piece(i)),
+            None => anyhow::bail!("No bitfield from peer")
+        }
+    }
+}
+
+// impl Clone for PeerHandle {
+//     fn clone(&self) -> Self {
+//         PeerHandle {
+//             sender: self.sender.clone(),
+//             status_rx: self.status_rx.clone(),
+//             bitfield_rx: self.bitfield_rx.clone(),
+//         }
+//     }
+// }
+#[derive(Debug)]
+pub struct Bitfield {
+    bytes: Vec<u8>,
+}
+
+impl Bitfield {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Bitfield {
+            bytes
+        }
+    }
+    pub fn has_piece(&self, i: usize) -> bool {
+        let byte_i = i / (u8::BITS as usize);
+        let bit_i = i % (u8::BITS as usize);
+
+        let byte = self.bytes[byte_i];
+        let right_shift = u8::BITS - (bit_i as u32) - 1;
+        eprintln!("check piece {i} in byte {byte:b}");
+        (byte >> right_shift) & 1 != 0
+    }
+}
+
+pub enum PeerAgentCommand {
+    Handshake {
+        handshake: Handshake,
+        tx: tokio::sync::oneshot::Sender<anyhow::Result<[u8; 20]>>,
+    },
+    Request {
+        message: PeerMessage,
+        tx: tokio::sync::oneshot::Sender<anyhow::Result<(usize, usize, Vec<u8>)>>,
+    },
 }

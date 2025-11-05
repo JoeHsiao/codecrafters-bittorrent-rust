@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
@@ -34,7 +34,7 @@ pub struct Info {
     /// In the single file case, name is the name of a file
     /// In the multiple file case, it's the name of a directory.
     /// It is purely advisory.
-    pub name: String,
+    pub name: PathBuf,
 
     /// piece length maps to the number of bytes in each piece the file is split into.
     #[serde(rename = "piece length")]
@@ -73,6 +73,6 @@ impl Display for FileList {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct FileDetails {
-    length: usize,
+    pub length: usize,
     path: Vec<String>,
 }
