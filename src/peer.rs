@@ -205,8 +205,7 @@ pub enum Status {
 
 
 pub struct PeerHandle {
-    pub request_rx: tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
-    pub agent_sender: SplitSink<Framed<TcpStream, PeerMessageCodec>, PeerMessage>,
+    pub command_tx: tokio::sync::mpsc::Sender<PeerMessage>,
     pub status_rx: tokio::sync::watch::Receiver<Option<Status>>,
     pub bitfield_rx: tokio::sync::watch::Receiver<Option<Bitfield>>,
 }

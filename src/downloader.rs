@@ -21,6 +21,8 @@ pub struct Downloader {
     torrent: Torrent,
     pieces_state: Vec<bool>,
     peer_handles: Vec<PeerHandle>,
+    block_tx: tokio::sync::mpsc::Sender<(usize, usize, Vec<u8>)>,
+    block_rx: tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
 }
 
 const PIECE_SHA1_LENGTH: usize = 20;
@@ -45,50 +47,81 @@ impl Downloader {
     //         }
     //     }
     // }
+    pub async fn new(torrent_path: impl AsRef<Path>) -> Result<Self> {
+        let t = Torrent::from_file(torrent_path);
+        let pieces_state = match Self::load_pieces_state() {
+            Some(state) => state,
+            None => {
+                vec![false; t.info.pieces.len() / PIECE_SHA1_LENGTH]
+            }
+        };
+        let (block_tx, block_rx) = tokio::sync::mpsc::channel(32);
 
-    pub async fn spawn_agent(&self, ip: SocketAddrV4) -> anyhow::Result<PeerHandle> {
-        let (request_tx, request_rx) = tokio::sync::mpsc::channel(32);
+        Ok(Downloader {
+            id: "cc112233445566778899"
+                .as_bytes()
+                .try_into()
+                .expect("Generate my id"),
+            torrent: t,
+            pieces_state,
+            peer_handles: Vec::new(),
+            block_tx,
+            block_rx,
+        })
+    }
+
+    pub async fn spawn_agent(
+        &self,
+        ip: SocketAddrV4,
+    ) -> anyhow::Result<PeerHandle> {
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(32);
         let (status_tx, status_rx) = tokio::sync::watch::channel(None);
         let (bitfield_tx, bitfield_rx) = tokio::sync::watch::channel(None);
 
         let id = self.id.clone();
         let info_hash = self.torrent.info_sha1().clone();
+        let block_tx = self.block_tx.clone();
+
         eprintln!("Spawning agent {ip}");
 
-        match PeerAgent::new(ip, id, info_hash, request_tx, status_tx, bitfield_tx).await {
-            Ok((mut agent, agent_sender)) => {
+        match PeerAgent::new(
+            ip,
+            id,
+            info_hash,
+            command_rx,
+            block_tx,
+            status_tx,
+            bitfield_tx,
+        )
+        .await
+        {
+            Ok(peer_agent) => {
                 let handle = PeerHandle {
-                    request_rx,
-                    agent_sender,
+                    command_tx,
                     status_rx,
                     bitfield_rx,
                 };
-                tokio::spawn(async move { agent.run().await });
+                tokio::spawn(async move { peer_agent.run().await });
                 Ok(handle)
             }
             Err(err) => {
-                eprintln!("Failed to spawn agent {ip}");
-                anyhow::bail!("Failed to spawn agent");
+                anyhow::bail!("Failed to spawn agent {ip}: {err}");
             }
         }
     }
 
-    pub async fn download_all_concurrently(
-        &mut self,
-        mut peer_handles: Vec<PeerHandle>,
-    ) -> anyhow::Result<()> {
+    pub async fn spawn_agents(&self, n: usize) -> Result<Vec<PeerHandle>> {
         let peer_ips = self
             .get_peers()
             .await
             .context("Get peer list from tracker")?;
 
-        let use_n_peers = 2 /* user config */;
-
+        let mut peer_handles = Vec::new();
         for ip in peer_ips {
             let handle = self.spawn_agent(ip).await.context("Connect to peer")?;
             peer_handles.push(handle);
 
-            if peer_handles.len() == use_n_peers {
+            if peer_handles.len() == n {
                 break;
             }
         }
@@ -97,7 +130,7 @@ impl Downloader {
             // Wait for choked/unchoked
             let bitfield = &mut handle.bitfield_rx;
             while bitfield.borrow().is_none() {
-                eprintln!("waiting for bitfield message");
+                eprintln!("Wait for bitfield message");
                 if bitfield.changed().await.is_err() {
                     break;
                 }
@@ -108,19 +141,27 @@ impl Downloader {
                 content: vec![],
             };
             handle
-                .agent_sender
+                .command_tx
                 .send(interested_msg)
                 .await
                 .context("Send interested")?;
 
             let status = &mut handle.status_rx;
             while status.borrow().is_none() {
-                eprintln!("waiting for choked/unchoked message");
+                eprintln!("Wait for choked/unchoked message");
                 if status.changed().await.is_err() {
                     break;
                 }
             }
         }
+
+        Ok(peer_handles)
+    }
+    pub async fn download_all_concurrently(
+        &mut self,
+        mut peer_handles: Vec<PeerHandle>,
+    ) -> anyhow::Result<()> {
+        let mut peer_handles = self.spawn_agents(3).await.context("Spawn agents")?;
 
         eprintln!("Agents are ready!");
 
@@ -129,9 +170,6 @@ impl Downloader {
             if self.pieces_state[i] {
                 continue;
             }
-            // let peers = self
-            //     .get_unchocked_peers_for_piece(i)
-            //     .context("Get unchocked peers")?;
             let piece_length = self.piece_length(i);
             let piece_sha1_offset = i * PIECE_SHA1_LENGTH;
             let expected_hash: [u8; 20] = self.torrent.info.pieces[piece_sha1_offset..]
@@ -140,7 +178,7 @@ impl Downloader {
                 .expect("get piece hash");
 
             let piece =
-                Self::download_piece_in_memory(&mut peer_handles, i, piece_length, expected_hash)
+                Self::download_piece_in_memory(&mut peer_handles, i, piece_length, expected_hash, &mut self.block_rx)
                     .await
                     .context("Download piece")?;
 
@@ -176,33 +214,12 @@ impl Downloader {
         )
     }
 
-    pub async fn download_piece_in_memory(
-        peers: &mut Vec<PeerHandle>,
+    pub async fn request_piece(
+        peers: &Vec<PeerHandle>,
         piece_i: usize,
         piece_length: usize,
-        expected_hash: [u8; 20],
-    ) -> anyhow::Result<Vec<u8>> {
-        // let peers = &mut self.peer_handles;
-        // let piece_length = self.piece_length(piece_i);
-        // let expected_hash = self.torrent.info_sha1();
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(!peers.is_empty(), "No peers available");
-        // Send an interested message
-        // let interested_msg = PeerMessage {
-        //     length: u32::to_be_bytes(1),
-        //     kind: 2,
-        //     content: vec![],
-        // };
-        // framed
-        //     .send(interested_msg)
-        //     .await
-        //     .expect("Send the interested message");
-        //
-        // // Read an unchoke message
-        // if let Some(msg) = framed.next().await {
-        //     let msg = msg.expect("Read the unchoke message");
-        //     assert_eq!(msg.kind, 1);
-        // }
-
         let n_block = piece_length.div_ceil(BLOCK_SIZE);
 
         let mut piece_buf = vec![0; piece_length];
@@ -210,62 +227,40 @@ impl Downloader {
         // round-robin peers
         for i in 0..n_block {
             // TODO skip handles that are either choked or not having this piece
-            let handle = &mut peers[i % n_peers];
+            let handle = &peers[i % n_peers];
             let offset = i * BLOCK_SIZE;
             let block_size = min(piece_length - offset, BLOCK_SIZE);
             let req = PeerMessage::new_request(piece_i, offset, block_size);
             handle
-                .agent_sender
+                .command_tx
                 .send(req)
                 .await
                 .context("Send Request message")?;
-
-            let (piece_i, offset, block) = handle.request_rx.recv().await.expect("Reeceive block");
-            anyhow::ensure!(block_size == block.len());
-            piece_buf[offset..][..block_size].copy_from_slice(block.as_slice());
         }
+        Ok(())
+    }
+    pub async fn download_piece_in_memory(
+        peers: &Vec<PeerHandle>,
+        piece_i: usize,
+        piece_length: usize,
+        expected_hash: [u8; 20],
+        block_rx: &mut tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
+    ) -> anyhow::Result<Vec<u8>> {
 
-        // let mut futures = FuturesUnordered::new();
-        // for rx in rxs {
-        //     futures.push(async move { rx.await });
-        // }
-        //
-        // while let Some(rx) = futures.next().await {
-        //     let rx = rx.context("Response from Request command")?;
-        //     let (piece_ind, offset, block) = rx.context("Get block data")?;
-        //
-        //     eprintln!("Got back piece_i: {piece_ind}, offset: {offset}");
-        //
-        //     anyhow::ensure!(piece_ind == piece_i, "Receive block for another piece");
-        //     piece_buf[offset..][..block.len()].copy_from_slice(block.as_slice());
-        // }
-        // let mut responses = futures_util::stream::iter(rxs.into_iter());
-        // while let Some(rs) = responses.next().await {
-        //     // (Result<Vec<u8>>, usize)
-        //     let (block, offset) = rs.await.context("Response of command Request")?;
-        //     let block = block.with_context(|| format!("Cannot get block with offset {offset}"))?;
-        //     piece_buf[offset..][..block.len()].copy_from_slice(block.as_slice());
-        // }
+        Self::request_piece(peers, piece_i, piece_length).await.context("Send requests for piece")?;
 
-        // for _ in 0..n_block {
-        //     if let Some(msg) = framed.next().await {
-        //         let msg = msg.expect("piece message");
-        //         assert_eq!(msg.kind, 7);
-        //
-        //         let (index, rest) = msg.content.split_at(4);
-        //         let index = u32::from_be_bytes(index.try_into().expect("Parse piece index"));
-        //         assert_eq!(index as usize, piece_index);
-        //
-        //         let (block_offset, data) = rest.split_at(4);
-        //         let block_offset =
-        //             u32::from_be_bytes(block_offset.try_into().expect("Parse block offset"))
-        //                 as usize;
-        //
-        //         data_buf[block_offset..block_offset + data.len()].copy_from_slice(data);
-        //     }
-        // }
-        // let piece_sha1_offset = piece_i * PIECE_SHA1_LENGTH;
-        // let expected_hash = &self.torrent.info.pieces[piece_sha1_offset..][..PIECE_SHA1_LENGTH];
+        let n_block = piece_length.div_ceil(BLOCK_SIZE);
+
+        let mut piece_buf = vec![0; piece_length];
+
+        let mut counter = 0;
+        while let Some((piece_i, offset, data)) = block_rx.recv().await {
+            piece_buf[offset..][..data.len()].copy_from_slice(data.as_slice());
+            counter += 1;
+            if counter == n_block {
+                break;
+            }
+        }
 
         anyhow::ensure!(
             expected_hash == *Sha1::digest(&piece_buf),
@@ -274,25 +269,7 @@ impl Downloader {
         Ok(piece_buf)
     }
 
-    pub async fn new(torrent_path: impl AsRef<Path>) -> Result<Self> {
-        let t = Torrent::from_file(torrent_path);
-        let pieces_state = match Self::load_pieces_state() {
-            Some(state) => state,
-            None => {
-                vec![false; t.info.pieces.len() / PIECE_SHA1_LENGTH]
-            }
-        };
 
-        Ok(Downloader {
-            id: "cc112233445566778899"
-                .as_bytes()
-                .try_into()
-                .expect("Generate my id"),
-            torrent: t,
-            pieces_state,
-            peer_handles: Vec::new(),
-        })
-    }
 
     // todo!("Rewrite this function to return an iterator instead")
     // fn get_where_to_write(&self, piece_i: usize, piece_len: usize) -> Vec<(PathBuf, usize, usize)> {
