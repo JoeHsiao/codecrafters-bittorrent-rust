@@ -4,24 +4,6 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-// pub async fn download_piece(
-//     torrent_path: impl AsRef<Path>,
-//     save_to: impl AsRef<Path>,
-//     piece_index: usize,
-// ) {
-//     let torrent = Torrent::from_file(&torrent_path);
-//     let peers = get_peers(&torrent).await;
-//     if peers.is_empty() {
-//         panic!("No peers found");
-//     }
-//     let piece = Downloader::download_piece_in_memory(
-//         &torrent,
-//         &peers[0],
-//         piece_index,
-//     )
-//     .await;
-//     fs::write(save_to, piece).expect("Save piece to disk");
-// }
 pub async fn handshake(torrent_path: impl AsRef<Path>, ip: &str) -> String {
     let mut stream = TcpStream::connect(ip).await.expect("Tcp connection");
     let torrent = Torrent::from_file(torrent_path);

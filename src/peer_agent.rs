@@ -1,14 +1,10 @@
-use crate::peer::{Bitfield, Handshake, PeerAgentCommand, PeerMessage, PeerMessageCodec, Status};
+use crate::peer::{Bitfield, Handshake, PeerMessage, PeerMessageCodec, Status};
 use anyhow::Context;
 use futures_util::sink::SinkExt;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{StreamExt, TryStreamExt};
-use std::collections::HashMap;
+use futures_util::StreamExt;
 use std::net::SocketAddrV4;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio_util::codec::Framed;
 
 pub struct PeerAgent {
@@ -49,8 +45,8 @@ impl PeerAgent {
         stream.read_exact(&mut buf).await.expect("Read from Tcp");
         let response: Handshake = Handshake::from_bytes(&buf);
         anyhow::ensure!(response.info_hash == info_hash, "info_hash does not match");
-        
-        eprintln!("Handshake done");
+
+        eprintln!("[Agent] Handshake done");
 
         let stream = Framed::new(stream, PeerMessageCodec {});
         Ok(Self {

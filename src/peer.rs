@@ -1,9 +1,8 @@
 use bytes::{Buf, BufMut, BytesMut};
-use futures_util::stream::SplitSink;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Handshake {
@@ -28,7 +27,6 @@ pub struct PeerMessage {
     pub kind: u8,
     pub content: Vec<u8>,
 }
-
 impl PeerMessage {
     pub fn new() -> Self {
         PeerMessage {
@@ -98,7 +96,6 @@ impl PeerMessage {
         Self::iterate_contents(self.content)
     }
 }
-
 impl Handshake {
     pub fn to_bytes(&self) -> BytesMut {
         let mut bytes = BytesMut::new();
@@ -120,7 +117,6 @@ impl Handshake {
         }
     }
 }
-
 pub struct PeerMessageCodec {}
 
 const MAX: usize = 2 * 16 * 1024;
@@ -172,7 +168,6 @@ impl Decoder for PeerMessageCodec {
         Ok(Some(peer_message))
     }
 }
-
 impl Encoder<PeerMessage> for PeerMessageCodec {
     type Error = std::io::Error;
 
@@ -202,14 +197,11 @@ pub enum Status {
     Choked,
     Unchoked,
 }
-
-
 pub struct PeerHandle {
     pub command_tx: tokio::sync::mpsc::Sender<PeerMessage>,
     pub status_rx: tokio::sync::watch::Receiver<Option<Status>>,
     pub bitfield_rx: tokio::sync::watch::Receiver<Option<Bitfield>>,
 }
-
 impl PeerHandle {
     pub fn is_unchocked(&self) -> bool {
         let status = match self.status_rx.borrow().as_ref() {
@@ -229,20 +221,10 @@ impl PeerHandle {
     }
 }
 
-// impl Clone for PeerHandle {
-//     fn clone(&self) -> Self {
-//         PeerHandle {
-//             sender: self.sender.clone(),
-//             status_rx: self.status_rx.clone(),
-//             bitfield_rx: self.bitfield_rx.clone(),
-//         }
-//     }
-// }
 #[derive(Debug)]
 pub struct Bitfield {
     bytes: Vec<u8>,
 }
-
 impl Bitfield {
     pub fn new(bytes: Vec<u8>) -> Self {
         Bitfield {
@@ -259,7 +241,6 @@ impl Bitfield {
         (byte >> right_shift) & 1 != 0
     }
 }
-
 pub enum PeerAgentCommand {
     Handshake {
         handshake: Handshake,

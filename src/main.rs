@@ -1,9 +1,9 @@
 extern crate core;
-use codecrafters_bittorrent::commands:: handshake;
+use codecrafters_bittorrent::commands::handshake;
+use codecrafters_bittorrent::downloader::Downloader;
 use codecrafters_bittorrent::torrent::Torrent;
 use serde_json;
-use std::env;
-use codecrafters_bittorrent::downloader::Downloader;
+use std::{env, fs};
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
@@ -70,6 +70,7 @@ async fn main() {
         let mut chunks = torrent.info.pieces.chunks_exact(20);
 
         println!("Track URL: {}", torrent.announce);
+        println!("name: {:?}", torrent.info.name);
         println!("Length: {}", torrent.info.files);
         println!("Info Hash: {}", torrent.info_sha1_hex());
         println!("Piece Length: {}", torrent.info.piece_length);
@@ -78,22 +79,38 @@ async fn main() {
             println!("{}", hex::encode(c));
         }
     } else if command == "peers" {
-        // let peers = get_peers_from_path(&args[2]).await;
-        // for peer in peers {
-        //     println!("{peer}");
-        // }
+        let downloader = Downloader::new(&args[2]).await.expect("Create downloader");
+        let peers = downloader.get_peers().await.expect("Get peers");
+        for peer in peers {
+            println!("{peer}");
+        }
     } else if command == "handshake" {
         println!("{}", handshake(&args[2], &args[3]).await);
     } else if command == "download_piece" {
-        // download_piece(
-        //     &args[4],
-        //     &args[3],
-        //     args[5].parse::<usize>().expect("parse piece index"),
-        // )
-        // .await;
+        let file_path = &args[3];
+        let torrent_path = &args[4];
+        let piece_i = &args[5].parse::<usize>().expect("Parse input piece i");
+
+        let mut downloader = Downloader::new(torrent_path)
+            .await
+            .expect("Create downloader");
+        downloader
+            .connect_to_peers(1)
+            .await
+            .expect("Connect to peers");
+        let mut piece = downloader
+            .download_range(*piece_i..*piece_i + 1)
+            .await
+            .expect("Download piece");
+        let bytes = piece.remove(piece_i).expect("Extract piece from result");
+        fs::write(file_path, bytes).expect("Save piece to disk");
     } else if command == "download_files" {
         let mut downloader = Downloader::new(&args[2]).await.expect("Create downloader");
-        downloader.download_all_concurrently(vec![]).await.expect("download files");
+        downloader
+            .connect_to_peers(5)
+            .await
+            .expect("Connect to peers");
+        downloader.download_all().await.expect("download files");
         println!("done!");
     } else {
         println!("unknown command: {}", args[1])

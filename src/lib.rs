@@ -1,8 +1,9 @@
-pub mod downloader;
-pub mod torrent;
 pub mod commands;
-pub mod tracker;
-pub mod peer;
-pub mod utils;
 pub mod consts;
+pub mod downloader;
+pub mod peer;
 pub mod peer_agent;
+pub mod piece;
+pub mod torrent;
+pub mod tracker;
+pub mod utils;

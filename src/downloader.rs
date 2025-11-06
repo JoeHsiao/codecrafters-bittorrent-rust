@@ -1,20 +1,18 @@
 use crate::consts::BLOCK_SIZE;
-use crate::peer::{PeerAgentCommand, PeerHandle, PeerMessage};
+use crate::peer::{PeerHandle, PeerMessage};
 use crate::peer_agent::PeerAgent;
+use crate::piece::Piece;
 use crate::torrent::{FileList, Torrent};
 use crate::tracker::TrackerResponse;
 use crate::utils::write_to_file;
 use anyhow::{Context, Result};
-use futures_util::stream::FuturesUnordered;
-use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, Url};
 use sha1::{Digest, Sha1};
 use std::cmp::min;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::str::FromStr;
-use std::thread::sleep;
-use std::time::Duration;
 
 pub struct Downloader {
     id: [u8; 20],
@@ -30,23 +28,6 @@ const PIECE_SHA1_LENGTH: usize = 20;
 impl Downloader {
     /// We assume that peers have all the pieces.
     /// todo!("Handle the situation where pieces are missing from peers")
-    // pub async fn download_all_sequential(&mut self) {
-    //     for i in 0..self.pieces_state.len() {
-    //         if self.pieces_state[i] {
-    //             continue;
-    //         }
-    //         let peers = &self.who_has_pieces[i];
-    //         if peers.is_empty() {
-    //             eprintln!("Nobody has piece {}", i);
-    //             todo!("handle the case if nobody has this piece")
-    //         }
-    //         let piece = Self::download_piece_in_memory(&self.torrent, &peers[0], i).await;
-    //         match self.write_piece_to_files(i, piece).await {
-    //             Ok(()) => self.pieces_state[i] = true,
-    //             Err(err) => panic!("{}: Failed to write piece {} to file", err, i),
-    //         }
-    //     }
-    // }
     pub async fn new(torrent_path: impl AsRef<Path>) -> Result<Self> {
         let t = Torrent::from_file(torrent_path);
         let pieces_state = match Self::load_pieces_state() {
@@ -70,10 +51,7 @@ impl Downloader {
         })
     }
 
-    pub async fn spawn_agent(
-        &self,
-        ip: SocketAddrV4,
-    ) -> anyhow::Result<PeerHandle> {
+    pub async fn spawn_agent(&self, ip: SocketAddrV4) -> anyhow::Result<PeerHandle> {
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(32);
         let (status_tx, status_rx) = tokio::sync::watch::channel(None);
         let (bitfield_tx, bitfield_rx) = tokio::sync::watch::channel(None);
@@ -110,7 +88,7 @@ impl Downloader {
         }
     }
 
-    pub async fn spawn_agents(&self, n: usize) -> Result<Vec<PeerHandle>> {
+    pub async fn connect_to_peers(&mut self, n: usize) -> Result<()> {
         let peer_ips = self
             .get_peers()
             .await
@@ -127,7 +105,6 @@ impl Downloader {
         }
 
         for handle in peer_handles.iter_mut() {
-            // Wait for choked/unchoked
             let bitfield = &mut handle.bitfield_rx;
             while bitfield.borrow().is_none() {
                 eprintln!("Wait for bitfield message");
@@ -155,52 +132,94 @@ impl Downloader {
             }
         }
 
-        Ok(peer_handles)
+        self.peer_handles = peer_handles;
+        Ok(())
     }
-    pub async fn download_all_concurrently(
+    pub async fn download_range<I>(
         &mut self,
-        mut peer_handles: Vec<PeerHandle>,
-    ) -> anyhow::Result<()> {
-        let mut peer_handles = self.spawn_agents(3).await.context("Spawn agents")?;
+        pieces_range: I,
+    ) -> anyhow::Result<HashMap<usize, Vec<u8>>>
+    where
+        I: IntoIterator<Item = usize> + Clone,
+    {
+        let pieces_range_clone = pieces_range.clone();
+        for i in pieces_range_clone {
+            self.request_piece(i)
+                .await
+                .context("Request piece from peers")?;
+        }
 
-        eprintln!("Agents are ready!");
-
-        let n_piece = self.pieces_state.len();
-        for i in 0..n_piece {
-            if self.pieces_state[i] {
-                continue;
-            }
-            let piece_length = self.piece_length(i);
-            let piece_sha1_offset = i * PIECE_SHA1_LENGTH;
-            let expected_hash: [u8; 20] = self.torrent.info.pieces[piece_sha1_offset..]
-                [..PIECE_SHA1_LENGTH]
-                .try_into()
-                .expect("get piece hash");
-
-            let piece =
-                Self::download_piece_in_memory(&mut peer_handles, i, piece_length, expected_hash, &mut self.block_rx)
+        self.retrieve_pieces(pieces_range)
+            .await
+            .context("Retrieve requested pieces")
+    }
+    pub async fn download_all(&mut self) -> anyhow::Result<()> {
+        let n_pieces = self.pieces_state.len();
+        // Buffer this many pieces in memory before writing them to disk.
+        // A piece is commonly 256k bytes.
+        let buf_n = 2 /* user config */;
+        for start in (0..n_pieces).step_by(buf_n) {
+            let range = start..(start + buf_n).min(n_pieces);
+            let pieces_bytes = self.download_range(range).await.context("Download range")?;
+            for (i, bytes) in pieces_bytes {
+                self.write_piece(i, &bytes)
                     .await
-                    .context("Download piece")?;
-
-            self.write_piece(i, piece).await.context("Write piece")?;
-            self.pieces_state[i] = true;
+                    .context("Write piece to file")?;
+                self.pieces_state[i] = true;
+            }
         }
         Ok(())
     }
+    fn expected_hash(&self, piece_i: usize) -> anyhow::Result<[u8; 20]> {
+        let piece_sha1_offset = piece_i * PIECE_SHA1_LENGTH;
+        let expected_hash: [u8; 20] = self.torrent.info.pieces[piece_sha1_offset..]
+            [..PIECE_SHA1_LENGTH]
+            .try_into()
+            .context("get piece hash")?;
+        Ok(expected_hash)
+    }
+    async fn retrieve_pieces<I>(&mut self, indices: I) -> anyhow::Result<HashMap<usize, Vec<u8>>>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut pieces_buf = HashMap::new();
+        let mut result = HashMap::new();
 
-    // async fn write_piece_to_files(&self, piece_i: usize, piece: Vec<u8>) -> Result<()> {
-    //     let dests = self.get_where_to_write(piece_i, piece.len());
-    //
-    //     let mut piece = &piece[..];
-    //     for (path, start, size) in dests {
-    //         let (val, rest) = piece.split_at(size);
-    //         write_to_file(&path, start, val.to_vec())
-    //             .await
-    //             .context("Write piece to file")?;
-    //         piece = rest;
-    //     }
-    //     Ok(())
-    // }
+        for i in indices {
+            let piece_length = self.piece_length(i);
+            pieces_buf.insert(i, Piece::new(piece_length));
+        }
+
+        if pieces_buf.is_empty() {
+            return Ok(result);
+        }
+
+        while let Some((piece_i, offset, block)) = self.block_rx.recv().await {
+            let Some(piece) = pieces_buf.get_mut(&piece_i) else {
+                anyhow::bail!("Receive a block that we did not request");
+            };
+            piece
+                .write(offset, block.as_slice())
+                .context("Save block in memory")?;
+            if piece.done() {
+                let bytes = pieces_buf
+                    .remove(&piece_i)
+                    .context("Remove piece from buf")?
+                    .bytes();
+                anyhow::ensure!(
+                    self.expected_hash(piece_i)
+                        .context("get expected piece hash")?
+                        == *Sha1::digest(&bytes)
+                );
+                result.insert(piece_i, bytes);
+            }
+            if pieces_buf.is_empty() {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
     fn total_length(&self) -> usize {
         match &self.torrent.info.files {
             FileList::SingleFile { length } => *length,
@@ -214,19 +233,16 @@ impl Downloader {
         )
     }
 
-    pub async fn request_piece(
-        peers: &Vec<PeerHandle>,
-        piece_i: usize,
-        piece_length: usize,
-    ) -> anyhow::Result<()> {
+    async fn request_piece(&self, piece_i: usize) -> anyhow::Result<()> {
+        let peers = &self.peer_handles;
         anyhow::ensure!(!peers.is_empty(), "No peers available");
+        let piece_length = self.piece_length(piece_i);
         let n_block = piece_length.div_ceil(BLOCK_SIZE);
-
-        let mut piece_buf = vec![0; piece_length];
         let n_peers = peers.len();
-        // round-robin peers
+
+        // round-robin
         for i in 0..n_block {
-            // TODO skip handles that are either choked or not having this piece
+            // TODO skip a handle if it is either choked or not having the desired piece
             let handle = &peers[i % n_peers];
             let offset = i * BLOCK_SIZE;
             let block_size = min(piece_length - offset, BLOCK_SIZE);
@@ -239,59 +255,8 @@ impl Downloader {
         }
         Ok(())
     }
-    pub async fn download_piece_in_memory(
-        peers: &Vec<PeerHandle>,
-        piece_i: usize,
-        piece_length: usize,
-        expected_hash: [u8; 20],
-        block_rx: &mut tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
-    ) -> anyhow::Result<Vec<u8>> {
 
-        Self::request_piece(peers, piece_i, piece_length).await.context("Send requests for piece")?;
-
-        let n_block = piece_length.div_ceil(BLOCK_SIZE);
-
-        let mut piece_buf = vec![0; piece_length];
-
-        let mut counter = 0;
-        while let Some((piece_i, offset, data)) = block_rx.recv().await {
-            piece_buf[offset..][..data.len()].copy_from_slice(data.as_slice());
-            counter += 1;
-            if counter == n_block {
-                break;
-            }
-        }
-
-        anyhow::ensure!(
-            expected_hash == *Sha1::digest(&piece_buf),
-            "Incorrect hash: piece {piece_i}. piece_length: {piece_length}"
-        );
-        Ok(piece_buf)
-    }
-
-
-
-    // todo!("Rewrite this function to return an iterator instead")
-    // fn get_where_to_write(&self, piece_i: usize, piece_len: usize) -> Vec<(PathBuf, usize, usize)> {
-    //     match &self.torrent.info.files {
-    //         FileList::SingleFile { length } => {
-    //             let global_start = self.torrent.info.piece_length * piece_i;
-    //             assert!(
-    //                 global_start + piece_len <= *length,
-    //                 "piece will be written over file boundary"
-    //             );
-    //             vec![(
-    //                 self.torrent.info.name.clone().into(),
-    //                 global_start,
-    //                 piece_len,
-    //             )]
-    //         }
-    //         FileList::MultiFile { .. } => {
-    //             todo!()
-    //         }
-    //     }
-    // }
-    async fn write_piece(&self, i: usize, piece: Vec<u8>) -> anyhow::Result<()> {
+    async fn write_piece(&self, i: usize, piece: &Vec<u8>) -> anyhow::Result<()> {
         let files = match &self.torrent.info.files {
             FileList::SingleFile { length } => {
                 let global_offset = self.torrent.info.piece_length * i;
@@ -299,7 +264,7 @@ impl Downloader {
                     global_offset + piece.len() <= *length,
                     "piece too large to insert into the file"
                 );
-                vec![(&self.torrent.info.name, global_offset, &piece[..])]
+                vec![(&self.torrent.info.name, global_offset, piece.as_slice())]
             }
             FileList::MultiFile { .. } => {
                 todo!()
@@ -318,32 +283,6 @@ impl Downloader {
     fn load_pieces_state() -> Option<Vec<bool>> {
         None
     }
-    fn get_unchocked_peers_for_piece(&mut self, i: usize) -> Result<Vec<&mut PeerHandle>> {
-        let peers = self
-            .peer_handles
-            .iter_mut()
-            .filter(|h| h.is_unchocked())
-            .filter_map(|h| match h.has_piece(i) {
-                Ok(true) => Some(Ok(h)),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .context("Missing bitfield")?;
-
-        Ok(peers)
-    }
-
-    // async fn fill_who_has_pieces(
-    //     peers: &Vec<SocketAddrV4>,
-    //     who_has_pieces: &mut Vec<Vec<SocketAddrV4>>,
-    //     info_hash: &[u8; 20],
-    // ) {
-    //     for peer in peers {
-    //         let bitfield = get_bitfield(peer, info_hash).await;
-    //         bitfield.for_each(|x| who_has_pieces[x].push(*peer));
-    //     }
-    // }
 
     pub async fn get_peers(&self) -> anyhow::Result<Vec<SocketAddrV4>> {
         let mut url = Url::from_str(&self.torrent.announce).context("Get tracker announce")?;

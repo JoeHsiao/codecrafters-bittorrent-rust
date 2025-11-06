@@ -1,9 +1,9 @@
-use std::fmt::{Display, Formatter};
-use std::fs;
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Torrent {
@@ -57,7 +57,6 @@ pub enum FileList {
     SingleFile { length: usize },
     MultiFile { files: Vec<FileDetails> },
 }
-
 impl Display for FileList {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -70,7 +69,6 @@ impl Display for FileList {
         }
     }
 }
-
 #[derive(Deserialize, Serialize, Debug)]
 pub struct FileDetails {
     pub length: usize,
